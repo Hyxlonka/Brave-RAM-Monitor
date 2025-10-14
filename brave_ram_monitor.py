@@ -4,6 +4,7 @@ import sys
 import os
 import logging
 import signal
+import sysconfig
 import ctypes
 
 from config import (RAM_LIMIT_MB, PROCESS_NAME, CHECK_INTERVAL_SECONDS, 
@@ -44,14 +45,33 @@ def _install_package_if_needed(package_name, import_name=None):
     except ImportError:
         log_section(f"🚨 Bibliothek '{package_name}' wird benötigt. Versuche automatische Installation...", separator='heavy', level=logging.WARNING)
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
-            __import__(import_name)  # Erneuter Import-Versuch
+            # Führe die Installation mit --no-cache-dir für eine saubere Installation durch
+            install_result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-cache-dir", package_name],
+                capture_output=True, text=True, encoding='utf-8', errors='ignore'
+            )
+            if install_result.returncode != 0:
+                raise subprocess.CalledProcessError(install_result.returncode, install_result.args, install_result.stdout, install_result.stderr)
+
+            # Spezielle Nachbehandlung für pywin32, um die Registrierung der DLLs sicherzustellen.
+            if package_name == "pywin32":
+                # Finde den korrekten 'Scripts'-Pfad für die aktuelle Python-Installation
+                scripts_dir = sysconfig.get_path('scripts')
+                post_install_script = os.path.join(scripts_dir, "pywin32_postinstall.py")
+                if os.path.isfile(post_install_script):
+                    logging.info("Führe pywin32 Post-Installationsskript aus...")
+                    subprocess.run([sys.executable, post_install_script, "-install"], capture_output=True)
+
+                logging.info("✅ 'pywin32' erfolgreich installiert.")
+                log_section("Bitte starten Sie das Skript neu, damit die Änderungen wirksam werden.", separator='heavy', level=logging.WARNING)
+                sys.exit(0)
+
             logging.info(f"✅ '{package_name}' erfolgreich installiert.")
             return True
-        except (subprocess.CalledProcessError, ImportError) as e:
+        except subprocess.CalledProcessError as e:
             logging.error(f"❌ FEHLER: Installation von '{package_name}' fehlgeschlagen.\n"
                           f"🛠️ Bitte manuell installieren: pip install {package_name}\n"
-                          f"📝 Details: {e}")
+                          f"📝 Details:\n--- STDOUT ---\n{e.stdout}\n--- STDERR ---\n{e.stderr}")
             return False
 
 # --- Abhängigkeiten prüfen und installieren ---
