@@ -108,27 +108,70 @@ def find_brave_executable_path():
                 return full_path
     return ""
 
-def get_brave_processes_and_memory():
-    """Ermittelt alle Brave-Prozesse und deren gesamten RAM-Verbrauch."""
+def find_active_brave_profiles(brave_processes):
+    """
+    Identifiziert aktive Brave-Profile durch die Analyse der von den Prozessen geöffneten Dateien.
+    Diese Methode ist zuverlässiger als das Parsen von Kommandozeilenargumenten.
+    """
+    active_profiles = set()
+    if sys.platform != "win32":
+        # Auf Nicht-Windows-Systemen ist das Parsen der Kommandozeile oft zuverlässiger.
+        # Diese Implementierung kann bei Bedarf hinzugefügt werden.
+        return list(active_profiles)
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return list(active_profiles)
+
+    user_data_path = os.path.join(local_app_data, "BraveSoftware", "Brave-Browser", "User Data")
+    if not os.path.isdir(user_data_path):
+        return list(active_profiles)
+
+    # Wir normalisieren den Pfad für zuverlässige Vergleiche
+    user_data_path_norm = os.path.normpath(user_data_path)
+
+    for proc in brave_processes:
+        try:
+            open_files = proc.open_files()
+            for file in open_files:
+                file_path_norm = os.path.normpath(file.path)
+                # Prüfen, ob die geöffnete Datei im "User Data"-Verzeichnis liegt
+                if file_path_norm.startswith(user_data_path_norm):
+                    # Extrahiere den Teil des Pfades direkt nach "User Data"
+                    relative_path = os.path.relpath(file_path_norm, user_data_path_norm)
+                    path_parts = relative_path.split(os.sep)
+                    if path_parts:
+                        profile_name = path_parts[0]
+                        # Gültige Profile sind "Default" oder "Profile X"
+                        if profile_name == "Default" or (profile_name.startswith("Profile ") and profile_name.split(" ")[1].isdigit()):
+                            active_profiles.add(profile_name)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Prozess könnte verschwunden sein oder wir haben keine Rechte, das ist ok.
+            continue
+    
+    return list(active_profiles)
+
+def get_brave_processes_and_memory_and_profiles():
+    """Ermittelt alle Brave-Prozesse, deren RAM-Verbrauch und die aktiven Profile."""
     brave_processes = []
     total_ram_bytes = 0
-    
-    for proc in psutil.process_iter(['name', 'memory_info']):
+
+    for proc in psutil.process_iter(['name', 'memory_info', 'cmdline']):
         try:
             name = proc.info.get('name')
-            if not name:
-                continue
-            
-            name_lower = name.lower()
-            if PROCESS_NAME in name_lower and 'crashhandler' not in name_lower:
+            if name and PROCESS_NAME in name.lower() and 'crashhandler' not in name.lower():
                 brave_processes.append(proc)
                 mem_info = proc.info.get('memory_info')
                 if mem_info and hasattr(mem_info, 'rss'):
                     total_ram_bytes += mem_info.rss
+                            
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass  # Prozess ist bereits weg oder unzugänglich, ignorieren.
     
-    return brave_processes, total_ram_bytes / (1024 * 1024)  # In MB
+    # Ermittle die aktiven Profile basierend auf den gefundenen Prozessen
+    profiles = find_active_brave_profiles(brave_processes)
+
+    return brave_processes, total_ram_bytes / (1024 * 1024), profiles
 
 def log_taskkill_result(result, mode="Graceful"):
     """Loggt das Ergebnis eines Taskkill-Befehls."""
@@ -142,7 +185,7 @@ def log_taskkill_result(result, mode="Graceful"):
     return True
 
 
-def restart_brave(processes_to_kill, brave_path):
+def restart_brave(processes_to_kill, brave_path, profiles):
     """Beendet die Brave-Prozesse und startet den Browser neu."""
     log_section(f"🔥 RAM-Limit überschritten. Starte Neustart-Prozedur.", level=logging.WARNING)
     
@@ -184,7 +227,7 @@ def restart_brave(processes_to_kill, brave_path):
                 # Das Warten erfolgt außerhalb des try-Blocks, um sicherzustellen, dass es immer ausgeführt wird.
                 time.sleep(GRACEFUL_SHUTDOWN_WAIT_SECONDS)
         # Stufe 2: Überprüfen und ggf. mit taskkill (graceful) nachhelfen
-        remaining_procs, _ = get_brave_processes_and_memory()
+        remaining_procs, _, _ = get_brave_processes_and_memory_and_profiles()
         if remaining_procs:
             logging.info("Stufe 2: Sende Anfrage zum Schließen via taskkill (Graceful)...")
             result = subprocess.run(["taskkill", "/IM", PROCESS_NAME + ".exe", "/T"], 
@@ -193,7 +236,7 @@ def restart_brave(processes_to_kill, brave_path):
             time.sleep(GRACEFUL_SHUTDOWN_WAIT_SECONDS)
             
             # Stufe 3: Letzte Überprüfung und erzwungenes Beenden
-            final_procs, _ = get_brave_processes_and_memory()
+            final_procs, _, _ = get_brave_processes_and_memory_and_profiles()
             if final_procs:
                 logging.warning("Graceful Shutdown fehlgeschlagen. Erzwinge das Beenden...")
                 result = subprocess.run(["taskkill", "/F", "/IM", PROCESS_NAME + ".exe", "/T"],
@@ -230,12 +273,21 @@ def restart_brave(processes_to_kill, brave_path):
     # Neustart des Browsers
     current_brave_path = brave_path or find_brave_executable_path()
     if current_brave_path:
-        logging.info(f"🚀 Starte Brave neu von: {current_brave_path}")
-        try:
-            subprocess.Popen([current_brave_path])
-            logging.info("✅ Neustart erfolgreich. Überwachung wird fortgesetzt.")
-        except Exception as e:
-            logging.error(f"❌ Fehler beim Neustart: {e}")
+        if profiles:
+            logging.info(f"🚀 Starte Brave mit {len(profiles)} gefundenen Profilen neu...")
+            for profile in profiles:
+                logging.info(f"  -> Starte Profil: {profile}")
+                try:
+                    subprocess.Popen([current_brave_path, f'--profile-directory={profile}'])
+                except Exception as e:
+                    logging.error(f"❌ Fehler beim Neustart von Profil '{profile}': {e}")
+        else:
+            logging.info(f"🚀 Starte Brave neu (keine spezifischen Profile gefunden): {current_brave_path}")
+            try:
+                subprocess.Popen([current_brave_path])
+            except Exception as e:
+                logging.error(f"❌ Fehler beim Neustart: {e}")
+        logging.info("✅ Neustart-Befehle gesendet. Überwachung wird fortgesetzt.")
     else:
         logging.warning("⚠️ Kein Brave-Pfad gefunden. Manueller Neustart erforderlich.")
 
@@ -273,7 +325,7 @@ def show_startup_info(brave_path):
 
 def monitor_and_restart(brave_path):
     """Überwacht den RAM-Verbrauch und startet bei Bedarf neu."""
-    processes, current_ram = get_brave_processes_and_memory()
+    processes, current_ram, profiles = get_brave_processes_and_memory_and_profiles()
     
     if not processes:
         logging.info("🔍 Kein Brave-Prozess gefunden.")
@@ -285,7 +337,7 @@ def monitor_and_restart(brave_path):
         logging.info(f"{status} RAM-Nutzung: {current_ram:,.2f} MB / {RAM_LIMIT_MB:,} MB ({ram_percentage:.1f}%)")
         
         if current_ram > RAM_LIMIT_MB:
-            restart_brave(processes, brave_path)
+            restart_brave(processes, brave_path, profiles)
 
 def check_admin_rights():
     """Prüft, ob Admin-Rechte vorhanden sind (nur Windows)."""
