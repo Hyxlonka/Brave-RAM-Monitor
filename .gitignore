@@ -1,2 +1,4 @@
 brave_ram_monitor.sh
 __pycache__/
+.vscode/
+build/
