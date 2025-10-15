@@ -4,13 +4,46 @@ import sys
 import os
 import logging
 import signal
-import sysconfig
 import ctypes
+import threading
 
-from config import (RAM_LIMIT_MB, PROCESS_NAME, CHECK_INTERVAL_SECONDS, 
-                    RESTART_WAIT_SECONDS, GRACEFUL_SHUTDOWN_WAIT_SECONDS, LOG_LEVEL)
+# --- Konfigurations-Management ---
+def load_or_create_config():
+    import json
+    """
+    Lädt die Konfiguration aus 'config.json' oder erstellt sie.
+    Gibt das Konfigurations-Dictionary zurück.
+    """
+    config_path = 'config.json'
+    
+    default_config = {
+        'RAM_LIMIT_MB': 4096,
+        'PROCESS_NAME': "brave",
+        'CHECK_INTERVAL_SECONDS': 60,
+        'RESTART_WAIT_SECONDS': 30,
+        'GRACEFUL_SHUTDOWN_WAIT_SECONDS': 5,
+        'LOG_LEVEL': 'INFO'
+    }
 
-# --- Logging-Helfer ---
+    if not os.path.exists(config_path):
+        logging.info(f"Konfigurationsdatei '{config_path}' nicht gefunden. Erstelle sie mit Standardwerten.")
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, indent=4)
+            return default_config
+        except IOError as e:
+            logging.error(f"Fehler beim Erstellen der Konfigurationsdatei: {e}. Verwende Standardwerte.")
+            return default_config
+    else:
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                user_config = json.load(f)
+                # Fülle fehlende Werte mit Defaults auf
+                return {**default_config, **user_config}
+        except (json.JSONDecodeError, IOError) as e:
+            logging.error(f"Fehler beim Lesen der Konfigurationsdatei: {e}. Verwende Standardwerte.")
+            return default_config
+
 LOG_SEPARATORS = {
     'normal': "-" * 60,
     'heavy': "=" * 60
@@ -18,20 +51,17 @@ LOG_SEPARATORS = {
 
 # --- System-Konstanten ---
 IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    # Dieser Block ist derzeit leer. Ein 'pass' macht die Absicht deutlich.
+    pass
 
-# --- Logging-Konfiguration ---
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(asctime)s [%(levelname)s] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 
 def log_section(message, separator='normal', level=logging.INFO):
     """Loggt eine Nachricht mit Trennzeichen."""
-    sep = LOG_SEPARATORS.get(separator, LOG_SEPARATORS['normal'])
+    sep = LOG_SEPARATORS.get(separator, "")
+    # Loggt zuerst die Trennlinie und dann die Nachricht für eine saubere Ausgabe.
     logging.log(level, sep)
     logging.log(level, message)
-    logging.log(level, sep)
 def signal_handler(signum, frame):
     """Behandelt Programm-Beendigung durch Signale für einen sauberen Exit."""
     logging.info("Signal zum Beenden empfangen. Brave RAM Monitor wird heruntergefahren...")
@@ -39,7 +69,10 @@ def signal_handler(signum, frame):
 
 
 def _install_package_if_needed(package_name, import_name=None):
-    """Prüft, ob ein Paket installiert ist, und installiert es bei Bedarf."""
+    """
+    Prüft, ob ein Paket installiert ist, und installiert es bei Bedarf.
+    Gibt 'restart_needed' zurück, wenn das Skript neu gestartet werden muss.
+    """
     if import_name is None:
         import_name = package_name
     try:
@@ -58,6 +91,7 @@ def _install_package_if_needed(package_name, import_name=None):
 
             # Spezielle Nachbehandlung für pywin32, um die Registrierung der DLLs sicherzustellen.
             if package_name == "pywin32":
+                import sysconfig # Nur bei Bedarf importieren
                 # Finde den korrekten 'Scripts'-Pfad für die aktuelle Python-Installation
                 scripts_dir = sysconfig.get_path('scripts')
                 post_install_script = os.path.join(scripts_dir, "pywin32_postinstall.py")
@@ -67,27 +101,24 @@ def _install_package_if_needed(package_name, import_name=None):
 
                 logging.info("✅ 'pywin32' erfolgreich installiert.")
                 log_section("Bitte starten Sie das Skript neu, damit die Änderungen wirksam werden.", separator='heavy', level=logging.WARNING)
-                sys.exit(0)
+                return 'restart_needed'
 
             logging.info(f"✅ '{package_name}' erfolgreich installiert.")
-            return True
+            return 'installed'
         except subprocess.CalledProcessError as e:
             logging.error(f"❌ FEHLER: Installation von '{package_name}' fehlgeschlagen.\n"
                           f"🛠️ Bitte manuell installieren: pip install {package_name}\n"
                           f"📝 Details:\n--- STDOUT ---\n{e.stdout}\n--- STDERR ---\n{e.stderr}")
             return False
 
-# --- Abhängigkeiten prüfen und installieren ---
-if not _install_package_if_needed("psutil"):
-    sys.exit(1)  # psutil ist zwingend erforderlich
-
 import psutil
-
-# pywin32 ist nur für Windows optional, aber empfohlen
-HAVE_PYWIN32 = IS_WINDOWS and _install_package_if_needed("pywin32", "win32gui")
 
 def find_brave_executable_path():
     """Sucht automatisch nach der Brave-Browser-Anwendung auf dem System."""
+    # Wenn das Skript als PyInstaller-Bundle läuft, kann der Pfad anders sein.
+    if getattr(sys, 'frozen', False):
+        # Dieser Block ist derzeit leer. Ein 'pass' macht die Absicht deutlich.
+        pass
     if not IS_WINDOWS:
         # shutil.which ist die robusteste Methode für POSIX-Systeme (Linux/macOS)
         import shutil
@@ -151,15 +182,15 @@ def find_active_brave_profiles(brave_processes):
     
     return list(active_profiles)
 
-def get_brave_processes_and_memory_and_profiles():
+def get_brave_processes_and_memory_and_profiles(config):
     """Ermittelt alle Brave-Prozesse, deren RAM-Verbrauch und die aktiven Profile."""
     brave_processes = []
     total_ram_bytes = 0
 
     for proc in psutil.process_iter(['name', 'memory_info', 'cmdline']):
         try:
-            name = proc.info.get('name')
-            if name and PROCESS_NAME in name.lower() and 'crashhandler' not in name.lower():
+            name = proc.info.get('name', '')
+            if name and config['PROCESS_NAME'] in name.lower() and 'crashhandler' not in name.lower():
                 brave_processes.append(proc)
                 mem_info = proc.info.get('memory_info')
                 if mem_info and hasattr(mem_info, 'rss'):
@@ -174,7 +205,7 @@ def get_brave_processes_and_memory_and_profiles():
     return brave_processes, total_ram_bytes / (1024 * 1024), profiles
 
 def log_taskkill_result(result, mode="Graceful"):
-    """Loggt das Ergebnis eines Taskkill-Befehls."""
+    """Loggt das Ergebnis eines 'taskkill'-Befehls."""
     if result.returncode != 0:
         if result.stderr:
             logging.warning(f"Taskkill ({mode}) Warnung: {result.stderr.strip()}")
@@ -185,13 +216,13 @@ def log_taskkill_result(result, mode="Graceful"):
     return True
 
 
-def restart_brave(processes_to_kill, brave_path, profiles):
+def restart_brave(processes_to_kill, brave_path, profiles, config, have_pywin32):
     """Beendet die Brave-Prozesse und startet den Browser neu."""
     log_section(f"🔥 RAM-Limit überschritten. Starte Neustart-Prozedur.", level=logging.WARNING)
     
     if IS_WINDOWS:
         # Stufe 1: Sanftes Beenden via pywin32 (bevorzugt)
-        if HAVE_PYWIN32:
+        if have_pywin32:
             try:
                 import win32gui, win32con, win32process
             except Exception as e: # Fängt alle potenziellen Import- oder Initialisierungsfehler ab
@@ -225,21 +256,21 @@ def restart_brave(processes_to_kill, brave_path, profiles):
                     logging.debug(f"EnumWindows/WM_CLOSE schlug fehl, fahre mit taskkill fort. Fehler: {e}")
                 
                 # Das Warten erfolgt außerhalb des try-Blocks, um sicherzustellen, dass es immer ausgeführt wird.
-                time.sleep(GRACEFUL_SHUTDOWN_WAIT_SECONDS)
+                time.sleep(config['GRACEFUL_SHUTDOWN_WAIT_SECONDS'])
         # Stufe 2: Überprüfen und ggf. mit taskkill (graceful) nachhelfen
         remaining_procs, _, _ = get_brave_processes_and_memory_and_profiles()
         if remaining_procs:
             logging.info("Stufe 2: Sende Anfrage zum Schließen via taskkill (Graceful)...")
-            result = subprocess.run(["taskkill", "/IM", PROCESS_NAME + ".exe", "/T"], 
+            result = subprocess.run(["taskkill", "/IM", config['PROCESS_NAME'] + ".exe", "/T"], 
                                   capture_output=True, text=True, encoding='utf-8', errors='ignore')
             log_taskkill_result(result, "Graceful")
-            time.sleep(GRACEFUL_SHUTDOWN_WAIT_SECONDS)
+            time.sleep(config['GRACEFUL_SHUTDOWN_WAIT_SECONDS'])
             
             # Stufe 3: Letzte Überprüfung und erzwungenes Beenden
             final_procs, _, _ = get_brave_processes_and_memory_and_profiles()
             if final_procs:
                 logging.warning("Graceful Shutdown fehlgeschlagen. Erzwinge das Beenden...")
-                result = subprocess.run(["taskkill", "/F", "/IM", PROCESS_NAME + ".exe", "/T"],
+                result = subprocess.run(["taskkill", "/F", "/IM", config['PROCESS_NAME'] + ".exe", "/T"],
                                       capture_output=True, text=True, encoding='utf-8', errors='ignore')
                 log_taskkill_result(result, "Force")
                 time.sleep(2)
@@ -292,7 +323,7 @@ def restart_brave(processes_to_kill, brave_path, profiles):
         logging.warning("⚠️ Kein Brave-Pfad gefunden. Manueller Neustart erforderlich.")
 
     log_section("Wartezeit nach Neustart...", separator='normal')
-    time.sleep(RESTART_WAIT_SECONDS)
+    time.sleep(config['RESTART_WAIT_SECONDS'])
 
 def safe_terminate_process(proc):
     """Beendet einen Prozess sicher mit Fehlerbehandlung und eskaliert zu kill, falls nötig."""
@@ -312,32 +343,33 @@ def get_status_emoji(percentage):
         return "🟡"
     return "🔴"
 
-def show_startup_info(brave_path):
+def show_startup_info(brave_path, config):
     """Zeigt Startinformationen an."""
     log_section("📊 Starte Brave RAM Monitor...", separator='heavy')
-    logging.info(f"⚙️ Logging-Level: {LOG_LEVEL}")
-    logging.info(f"🎯 RAM-Limit: {RAM_LIMIT_MB:,} MB")
+    logging.info(f"⚙️ Logging-Level: {config['LOG_LEVEL']}")
+    logging.info(f"🎯 RAM-Limit: {config['RAM_LIMIT_MB']:,} MB")
     
     if brave_path:
         logging.info(f"📂 Brave-Pfad gefunden: {brave_path}")
     else:
         logging.warning("⚠️ Brave-Pfad nicht sofort gefunden. Es wird beim Neustart erneut gesucht.")
 
-def monitor_and_restart(brave_path):
+def monitor_and_restart(brave_path, config, have_pywin32):
     """Überwacht den RAM-Verbrauch und startet bei Bedarf neu."""
-    processes, current_ram, profiles = get_brave_processes_and_memory_and_profiles()
+    processes, current_ram, profiles = get_brave_processes_and_memory_and_profiles(config)
     
     if not processes:
         logging.info("🔍 Kein Brave-Prozess gefunden.")
         return
     
-    if RAM_LIMIT_MB > 0:
-        ram_percentage = (current_ram / RAM_LIMIT_MB) * 100
+    ram_limit = config['RAM_LIMIT_MB']
+    if ram_limit > 0:
+        ram_percentage = (current_ram / ram_limit) * 100
         status = get_status_emoji(ram_percentage)
-        logging.info(f"{status} RAM-Nutzung: {current_ram:,.2f} MB / {RAM_LIMIT_MB:,} MB ({ram_percentage:.1f}%)")
+        logging.info(f"{status} RAM-Nutzung: {current_ram:,.2f} MB / {ram_limit:,} MB ({ram_percentage:.1f}%)")
         
-        if current_ram > RAM_LIMIT_MB:
-            restart_brave(processes, brave_path, profiles)
+        if current_ram > ram_limit:
+            restart_brave(processes, brave_path, profiles, config, have_pywin32)
 
 def check_admin_rights():
     """Prüft, ob Admin-Rechte vorhanden sind (nur Windows)."""
@@ -354,18 +386,40 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # Temporäres Logging für die Initialisierungsphase
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    # --- Abhängigkeiten prüfen und installieren ---
+    if not _install_package_if_needed("psutil"):
+        sys.exit(1)  # psutil ist zwingend erforderlich
+
+    # pywin32 ist nur für Windows optional, aber empfohlen
+    pywin32_install_result = _install_package_if_needed("pywin32", "win32gui") if IS_WINDOWS else False
+    if pywin32_install_result == 'restart_needed':
+        sys.exit(0)
+    have_pywin32 = pywin32_install_result is not False
+
+    config = load_or_create_config()
+    log_level_from_config = getattr(logging, config.get('LOG_LEVEL', 'INFO').upper(), logging.INFO)
+    logging.basicConfig(level=log_level_from_config,
+                        format='%(asctime)s [%(levelname)s] - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S', force=True) # force=True überschreibt die temporäre Konfig
+    logging.getLogger().setLevel(log_level_from_config)
+
     if not check_admin_rights():
         log_section("⚠️  Script läuft ohne Admin-Rechte. Der erzwungene Neustart (Force-Kill) könnte fehlschlagen.", separator='heavy', level=logging.WARNING)
 
     brave_path = find_brave_executable_path()
-    show_startup_info(brave_path)
-    
+    show_startup_info(brave_path, config)
+
+    # Haupt-Überwachungsschleife
     while True:
         try:
-            monitor_and_restart(brave_path)
-            time.sleep(CHECK_INTERVAL_SECONDS)
+            monitor_and_restart(brave_path, config, have_pywin32)
+            time.sleep(config.get('CHECK_INTERVAL_SECONDS', 60))
         except Exception as e:
             logging.critical(f"❌ Unerwarteter Fehler in der Hauptschleife: {e}", exc_info=True)
+            # Kurze Pause bei unerwarteten Fehlern
             time.sleep(10)
 
 if __name__ == "__main__":

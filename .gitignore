@@ -1,34 +1,38 @@
-# Python Bytecode und Cache-Verzeichnisse
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Editor-spezifische Konfiguration
-.vscode/
+# C extensions
+*.so
 
-# PyInstaller Build-Artefakte
-# Temporäre Build-Dateien und Konfiguration
-/build/
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
 *.spec
 
-# Inhalte des 'dist'-Ordners ignorieren, mit Ausnahme der finalen EXE
-dist/*
-!dist/brave-ram-monitor.exe
+# Konfigurationsdateien, die nicht versioniert werden sollen
+config.json
 
-# Virtuelle Umgebungen
-# Verzeichnisse für Python-Paketabhängigkeiten
-/venv/
-/env/
-/.venv/
-/.env/
+# Veraltete Dateien
+config.py
 
-# Betriebssystem-spezifische Dateien
-.DS_Store
-Thumbs.db
-
-# Log-Dateien (falls du später Logging in Dateien hinzufügst)
+# Log-Dateien
 *.log
 
-# Shell-Skripte (falls vorhanden)
-*.sh
+# IDE- / Editor-spezifische Ordner
+.vscode/
+.idea/
+
+brave-restarter.code-workspace
