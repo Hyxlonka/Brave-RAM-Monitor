@@ -16,6 +16,9 @@ LOG_SEPARATORS = {
     'heavy': "=" * 60
 }
 
+# --- System-Konstanten ---
+IS_WINDOWS = sys.platform == "win32"
+
 # --- Logging-Konfiguration ---
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -81,12 +84,12 @@ if not _install_package_if_needed("psutil"):
 import psutil
 
 # pywin32 ist nur für Windows optional, aber empfohlen
-HAVE_PYWIN32 = sys.platform == "win32" and _install_package_if_needed("pywin32", "win32gui")
+HAVE_PYWIN32 = IS_WINDOWS and _install_package_if_needed("pywin32", "win32gui")
 
 def find_brave_executable_path():
     """Sucht automatisch nach der Brave-Browser-Anwendung auf dem System."""
-    # shutil.which ist die robusteste Methode für POSIX-Systeme (Linux/macOS)
-    if sys.platform != "win32":
+    if not IS_WINDOWS:
+        # shutil.which ist die robusteste Methode für POSIX-Systeme (Linux/macOS)
         import shutil
         for exe in ("brave-browser", "brave"):
             path = shutil.which(exe)
@@ -96,16 +99,13 @@ def find_brave_executable_path():
 
     # Windows-spezifische Suche
     possible_locations = [
-        (os.environ.get("ProgramFiles"), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
-        (os.environ.get("ProgramFiles(x86)"), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
-        (os.environ.get("LOCALAPPDATA"), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+        os.path.join(os.environ.get(env, ""), "BraveSoftware\\Brave-Browser\\Application\\brave.exe")
+        for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")
     ]
     
-    for base_path, relative_path in possible_locations:
-        if base_path:
-            full_path = os.path.join(base_path, relative_path)
-            if os.path.isfile(full_path):
-                return full_path
+    for path in possible_locations:
+        if os.path.isfile(path):
+            return path
     return ""
 
 def find_active_brave_profiles(brave_processes):
@@ -114,7 +114,7 @@ def find_active_brave_profiles(brave_processes):
     Diese Methode ist zuverlässiger als das Parsen von Kommandozeilenargumenten.
     """
     active_profiles = set()
-    if sys.platform != "win32":
+    if not IS_WINDOWS:
         # Auf Nicht-Windows-Systemen ist das Parsen der Kommandozeile oft zuverlässiger.
         # Diese Implementierung kann bei Bedarf hinzugefügt werden.
         return list(active_profiles)
@@ -189,7 +189,7 @@ def restart_brave(processes_to_kill, brave_path, profiles):
     """Beendet die Brave-Prozesse und startet den Browser neu."""
     log_section(f"🔥 RAM-Limit überschritten. Starte Neustart-Prozedur.", level=logging.WARNING)
     
-    if sys.platform == "win32":
+    if IS_WINDOWS:
         # Stufe 1: Sanftes Beenden via pywin32 (bevorzugt)
         if HAVE_PYWIN32:
             try:
@@ -341,7 +341,7 @@ def monitor_and_restart(brave_path):
 
 def check_admin_rights():
     """Prüft, ob Admin-Rechte vorhanden sind (nur Windows)."""
-    if sys.platform == "win32":
+    if IS_WINDOWS:
         try:
             return ctypes.windll.shell32.IsUserAnAdmin() != 0
         except Exception:
