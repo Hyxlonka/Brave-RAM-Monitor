@@ -1,4 +1,34 @@
-brave_ram_monitor.sh
+# Python Bytecode und Cache-Verzeichnisse
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editor-spezifische Konfiguration
 .vscode/
-build/
+
+# PyInstaller Build-Artefakte
+# Temporäre Build-Dateien und Konfiguration
+/build/
+*.spec
+
+# Inhalte des 'dist'-Ordners ignorieren, mit Ausnahme der finalen EXE
+dist/*
+!dist/brave-ram-monitor.exe
+
+# Virtuelle Umgebungen
+# Verzeichnisse für Python-Paketabhängigkeiten
+/venv/
+/env/
+/.venv/
+/.env/
+
+# Betriebssystem-spezifische Dateien
+.DS_Store
+Thumbs.db
+
+# Log-Dateien (falls du später Logging in Dateien hinzufügst)
+*.log
+
+# Shell-Skripte (falls vorhanden)
+*.sh
