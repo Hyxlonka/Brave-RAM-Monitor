@@ -21,7 +21,8 @@ def load_or_create_config():
         'PROCESS_NAME': "brave",
         'CHECK_INTERVAL_SECONDS': 60,
         'RESTART_WAIT_SECONDS': 30,
-        'GRACEFUL_SHUTDOWN_WAIT_SECONDS': 5,
+        'WM_CLOSE_WAIT_SECONDS': 10, # Extra Zeit für die sauberste Methode (WM_CLOSE)
+        'GRACEFUL_SHUTDOWN_WAIT_SECONDS': 5, # Kürzere Zeit für die Taskkill-Methoden
         'LOG_LEVEL': 'INFO'
     }
 
@@ -186,16 +187,32 @@ def get_brave_processes_and_memory_and_profiles(config):
     """Ermittelt alle Brave-Prozesse, deren RAM-Verbrauch und die aktiven Profile."""
     brave_processes = []
     total_ram_bytes = 0
+    # Hole die PID des aktuellen Skripts, um es selbst zu ignorieren.
+    # Das ist entscheidend, wenn das Skript zu einer .exe mit "brave" im Namen kompiliert wird.
+    self_pid = os.getpid()
 
     for proc in psutil.process_iter(['name', 'memory_info', 'cmdline']):
         try:
             name = proc.info.get('name', '')
-            if name and config['PROCESS_NAME'] in name.lower() and 'crashhandler' not in name.lower():
+            # Sicherstellen, dass cmdline immer eine Liste ist, auch wenn psutil 'None' zurückgibt.
+            cmdline = proc.info.get('cmdline') or []
+
+            # Zuverlässigere Identifizierung von echten Brave-Prozessen.
+            # Ein kompilertes Skript (brave_ram_monitor.exe) hat keine "--type" Argumente.
+            is_real_brave_process = any(arg.startswith('--type=') for arg in cmdline)
+
+            # Der Haupt-Browser-Prozess hat oft kein '--type', aber auch keine anderen verdächtigen Argumente.
+            # Wir fügen ihn hinzu, wenn er nicht bereits als "real" identifiziert wurde.
+            is_main_brave_process = (not is_real_brave_process and cmdline and "Brave-Browser" in cmdline[0])
+
+            is_target_process = is_real_brave_process or is_main_brave_process
+
+            if name and config['PROCESS_NAME'] in name.lower() and 'crashhandler' not in name.lower() and proc.pid != self_pid and is_target_process:
                 brave_processes.append(proc)
                 mem_info = proc.info.get('memory_info')
                 if mem_info and hasattr(mem_info, 'rss'):
                     total_ram_bytes += mem_info.rss
-                            
+
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass  # Prozess ist bereits weg oder unzugänglich, ignorieren.
     
@@ -206,26 +223,31 @@ def get_brave_processes_and_memory_and_profiles(config):
 
 def log_taskkill_result(result, mode="Graceful"):
     """Loggt das Ergebnis eines 'taskkill'-Befehls."""
-    if result.returncode != 0:
-        if result.stderr:
-            logging.warning(f"Taskkill ({mode}) Warnung: {result.stderr.strip()}")
-        if result.stdout:
-            # stdout kann bei "Prozess nicht gefunden" nützlich sein, was kein echter Fehler ist
-            logging.debug(f"Taskkill ({mode}) Ausgabe: {result.stdout.strip()}")
-        return False
+    # Wenn der Prozess nicht gefunden wurde, ist das in unserem Fall ein Erfolg,
+    # da das Ziel (Prozess beenden) erreicht ist.
+    if result.returncode != 0 and "nicht gefunden" not in result.stderr:
+        # Logge nur "echte" Fehler als Warnung.
+        error_message = result.stderr.strip() if result.stderr else "Unbekannter Fehler"
+        logging.warning(f"Taskkill ({mode}) Warnung: {error_message}")
+        return False # Echter Fehler
+    
+    if result.returncode != 0 and "nicht gefunden" in result.stderr:
+        logging.info(f"Taskkill ({mode}): Prozess war bereits beendet.")
+        return True # Erfolg, da Prozess nicht mehr läuft
+
     return True
 
 
-def restart_brave(processes_to_kill, brave_path, profiles, config, have_pywin32):
-    """Beendet die Brave-Prozesse und startet den Browser neu."""
+def restart_brave(processes_to_kill, config, have_pywin32):
+    """Führt einen mehrstufigen, sauberen Shutdown der Brave-Prozesse durch."""
     log_section(f"🔥 RAM-Limit überschritten. Starte Neustart-Prozedur.", level=logging.WARNING)
-    
+
     if IS_WINDOWS:
         # Stufe 1: Sanftes Beenden via pywin32 (bevorzugt)
         if have_pywin32:
             try:
                 import win32gui, win32con, win32process
-            except Exception as e: # Fängt alle potenziellen Import- oder Initialisierungsfehler ab
+            except ImportError as e: # Fängt spezifisch Import-Fehler ab
                 logging.warning(f"Konnte pywin32 nicht für den Shutdown nutzen (falle auf taskkill zurück). Fehler: {e}")
             else:
                 # Dies ist die sauberste Methode: Wir simulieren einen Klick auf das "X" des Fensters.
@@ -254,54 +276,65 @@ def restart_brave(processes_to_kill, brave_path, profiles, config, have_pywin32)
                     win32gui.EnumWindows(close_brave_window, None)
                 except Exception as e:
                     logging.debug(f"EnumWindows/WM_CLOSE schlug fehl, fahre mit taskkill fort. Fehler: {e}")
+
+                # --- Robuster Polling-Mechanismus für Stufe 1 ---
+                total_wait_time = config.get('WM_CLOSE_WAIT_SECONDS', 10) + 5 # Gesamtzeit, um auf den sanften Shutdown zu warten
+                for i in range(total_wait_time):
+                    procs, _, _ = get_brave_processes_and_memory_and_profiles(config)
+                    if not procs:
+                        logging.info(f"✅ Stufe 1 war erfolgreich. Alle Prozesse nach {i+1}s beendet.")
+                        return
+                    time.sleep(1)
                 
-                # Das Warten erfolgt außerhalb des try-Blocks, um sicherzustellen, dass es immer ausgeführt wird.
-                time.sleep(config['GRACEFUL_SHUTDOWN_WAIT_SECONDS'])
-        # Stufe 2: Überprüfen und ggf. mit taskkill (graceful) nachhelfen
-        remaining_procs, _, _ = get_brave_processes_and_memory_and_profiles()
-        if remaining_procs:
-            logging.info("Stufe 2: Sende Anfrage zum Schließen via taskkill (Graceful)...")
-            result = subprocess.run(["taskkill", "/IM", config['PROCESS_NAME'] + ".exe", "/T"], 
-                                  capture_output=True, text=True, encoding='utf-8', errors='ignore')
-            log_taskkill_result(result, "Graceful")
-            time.sleep(config['GRACEFUL_SHUTDOWN_WAIT_SECONDS'])
-            
-            # Stufe 3: Letzte Überprüfung und erzwungenes Beenden
-            final_procs, _, _ = get_brave_processes_and_memory_and_profiles()
-            if final_procs:
-                logging.warning("Graceful Shutdown fehlgeschlagen. Erzwinge das Beenden...")
-                result = subprocess.run(["taskkill", "/F", "/IM", config['PROCESS_NAME'] + ".exe", "/T"],
-                                      capture_output=True, text=True, encoding='utf-8', errors='ignore')
-                log_taskkill_result(result, "Force")
-                time.sleep(2)
+                # Wenn wir hier ankommen, ist der Polling-Timeout abgelaufen.
+                final_procs, _, _ = get_brave_processes_and_memory_and_profiles(config)
+                if final_procs:
+                    # Detailliertes Logging zur Identifizierung des verbleibenden Prozesses
+                    proc_details = [f"'{p.name()}' (PID: {p.pid})" for p in final_procs]
+                    logging.warning(f"Stufe 1 Timeout. {len(final_procs)} Prozess(e) noch aktiv. Eskaliere zu Stufe 2.")
+                    logging.info(f"  -> Verbleibende(r) Prozess(e): {', '.join(proc_details)}")
+
+
+        # --- Stufe 2: Graceful Taskkill ---
+        # Dieser Block wird nur erreicht, wenn Stufe 1 (falls versucht) nicht alle Prozesse beendet hat.
+        logging.info("Stufe 2: Sende Anfrage zum Schließen via taskkill (Graceful)...")
+        result = subprocess.run(["taskkill", "/IM", config['PROCESS_NAME'] + ".exe", "/T"], capture_output=True, text=True, encoding='utf-8', errors='ignore')
+        log_taskkill_result(result, "Graceful")
+        time.sleep(config['GRACEFUL_SHUTDOWN_WAIT_SECONDS'])
+
+        # --- Prüfung direkt nach Stufe 2 ---
+        procs, _, _ = get_brave_processes_and_memory_and_profiles(config)
+        if not procs:
+            logging.info("✅ Stufe 2 war erfolgreich. Alle Prozesse wurden beendet.")
+            return
+
+        # --- Stufe 3: Force Kill ---
+        # Dieser Block wird nur erreicht, wenn auch Stufe 2 nicht alle Prozesse beendet hat.
+        logging.warning("Graceful Shutdown fehlgeschlagen. Erzwinge das Beenden (Stufe 3)...")
+        result = subprocess.run(["taskkill", "/F", "/IM", config['PROCESS_NAME'] + ".exe", "/T"], capture_output=True, text=True, encoding='utf-8', errors='ignore')
+        log_taskkill_result(result, "Force")
+        time.sleep(2)
+        # Letzte Prüfung, um sicherzustellen, dass alles beendet ist.
+        if not get_brave_processes_and_memory_and_profiles(config)[0]:
+            logging.info("✅ Stufe 3 war erfolgreich. Alle Prozesse wurden beendet.")
     else:
         # Sauberes Beenden für POSIX-Systeme (Linux, macOS)
+        pids_to_kill = {p.pid for p in processes_to_kill if hasattr(p, 'pid')}
         parent_procs = []
-        pids_to_kill = set()
-        try:
-            # Kompatible und sichere Methode zum Sammeln von PIDs
-            for p in processes_to_kill:
-                pid = getattr(p, 'pid', None)
-                if pid is not None:
-                    pids_to_kill.add(pid) # Python 3.7-kompatibel
-        except psutil.Error:
-            pass # Fallback auf leeres Set bei unerwartetem Fehler
         for p in processes_to_kill:
             try:
                 # Prüfen, ob der Elternprozess nicht auch ein Brave-Prozess ist
                 if p.is_running() and p.ppid() not in pids_to_kill:
                     parent_procs.append(p)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+                continue
         logging.info(f"Sende 'terminate' Signal an {len(parent_procs)} Brave-Hauptprozess(e)...")
         for p in parent_procs:
             safe_terminate_process(p)
-        
-        # Kurze Pause nach dem Versuch, alle Prozesse zu beenden
-        time.sleep(2)
+        time.sleep(config['GRACEFUL_SHUTDOWN_WAIT_SECONDS'])
 
-
-    # Neustart des Browsers
+def start_brave(brave_path, profiles):
+    """Startet Brave mit den angegebenen Profilen."""
     current_brave_path = brave_path or find_brave_executable_path()
     if current_brave_path:
         if profiles:
@@ -321,9 +354,6 @@ def restart_brave(processes_to_kill, brave_path, profiles, config, have_pywin32)
         logging.info("✅ Neustart-Befehle gesendet. Überwachung wird fortgesetzt.")
     else:
         logging.warning("⚠️ Kein Brave-Pfad gefunden. Manueller Neustart erforderlich.")
-
-    log_section("Wartezeit nach Neustart...", separator='normal')
-    time.sleep(config['RESTART_WAIT_SECONDS'])
 
 def safe_terminate_process(proc):
     """Beendet einen Prozess sicher mit Fehlerbehandlung und eskaliert zu kill, falls nötig."""
@@ -369,7 +399,10 @@ def monitor_and_restart(brave_path, config, have_pywin32):
         logging.info(f"{status} RAM-Nutzung: {current_ram:,.2f} MB / {ram_limit:,} MB ({ram_percentage:.1f}%)")
         
         if current_ram > ram_limit:
-            restart_brave(processes, brave_path, profiles, config, have_pywin32)
+            restart_brave(processes, config, have_pywin32)
+            start_brave(brave_path, profiles)
+            log_section("Wartezeit nach Neustart...", separator='normal')
+            time.sleep(config['RESTART_WAIT_SECONDS'])
 
 def check_admin_rights():
     """Prüft, ob Admin-Rechte vorhanden sind (nur Windows)."""

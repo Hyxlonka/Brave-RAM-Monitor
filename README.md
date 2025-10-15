@@ -31,7 +31,22 @@ python brave_ram_monitor.py
 - PyWin32 wird automatisch installiert für verbesserte Prozessbehandlung
 
 ## Konfiguration
-Editiere `config.py` für folgende Einstellungen:
-- RAM_LIMIT_MB: Maximaler RAM-Verbrauch in MB
-- CHECK_INTERVAL_SECONDS: Prüfintervall
-- RESTART_WAIT_SECONDS: Wartezeit nach Neustart
+
+Beim ersten Start wird automatisch eine `config.json`-Datei erstellt. Sie können diese Datei anpassen, um das Verhalten des Skripts zu steuern:
+
+-   `RAM_LIMIT_MB`: Das RAM-Limit in Megabyte, bei dessen Überschreitung der Neustart ausgelöst wird.
+-   `PROCESS_NAME`: Der Name des zu überwachenden Prozesses (z.B. "brave").
+-   `CHECK_INTERVAL_SECONDS`: Das Intervall in Sekunden, in dem der RAM-Verbrauch geprüft wird.
+-   `RESTART_WAIT_SECONDS`: Die Wartezeit in Sekunden nach einem Neustart, bevor die Überwachung fortgesetzt wird.
+-   `WM_CLOSE_WAIT_SECONDS`: Die Wartezeit in Sekunden für den sanften Shutdown (Stufe 1), um dem Browser Zeit zum Speichern zu geben.
+-   `GRACEFUL_SHUTDOWN_WAIT_SECONDS`: Die Wartezeit für die `taskkill`-Stufen.
+-   `LOG_LEVEL`: Der Detailgrad der Log-Ausgaben (z.B. 'INFO', 'DEBUG', 'WARNING').
+
+## Kompilieren (Optional)
+
+Wenn Sie das Skript zu einer eigenständigen `.exe`-Datei kompilieren möchten, können Sie PyInstaller verwenden. Das Skript ist so konzipiert, dass es auch in kompilierter Form zuverlässig funktioniert.
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed brave_ram_monitor.py
+```
